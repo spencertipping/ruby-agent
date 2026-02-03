@@ -1,0 +1,1756 @@
+#!/usr/bin/env ruby
+require 'digest'
+require 'expect'
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'open3'
+require 'pty'
+require 'set'
+require 'tempfile'
+require 'tmpdir'
+require 'uri'
+require 'yaml'
+
+
+# Configuration
+$LLM_CACHE_DIR = File.expand_path(".llm-cache")
+$LLM_PINNED_DIR = File.expand_path(".llm-pinned")
+FileUtils.mkdir_p($LLM_CACHE_DIR)
+FileUtils.mkdir_p($LLM_PINNED_DIR)
+
+MODEL_ALIASES = {
+  opus: "anthropic/claude-opus-4.5",
+  pro: "google/gemini-3-pro-preview",
+  flash: "google/gemini-3-flash-preview"
+}
+
+
+# --- Cache Helpers ---
+module LLMCache
+  def self.find(filename, pinned: false)
+    # If pinned is strictly requested, we prefer the pinned version,
+    # but we might want to "promote" a regular cache hit to a pin.
+    if pinned
+      pinned_path = File.join($LLM_PINNED_DIR, filename)
+      return pinned_path if File.exist?(pinned_path)
+
+      # Fallback: check regular cache and promote if found
+      regular_path = File.join($LLM_CACHE_DIR, filename)
+      if File.exist?(regular_path)
+        FileUtils.cp(regular_path, pinned_path)
+        return pinned_path
+      end
+    else
+      # Normal lookup: Check pinned first (it's valid), then regular
+      pinned_path = File.join($LLM_PINNED_DIR, filename)
+      return pinned_path if File.exist?(pinned_path)
+
+      regular_path = File.join($LLM_CACHE_DIR, filename)
+      return regular_path if File.exist?(regular_path)
+    end
+
+    nil
+  end
+
+  def self.write(filename, content, pinned: false)
+    # Always write to regular cache
+    regular_path = File.join($LLM_CACHE_DIR, filename)
+    File.write(regular_path, content)
+
+    # If pinned, also write to pinned cache
+    if pinned
+      pinned_path = File.join($LLM_PINNED_DIR, filename)
+      File.write(pinned_path, content)
+      pinned_path
+    else
+      regular_path
+    end
+  end
+end
+
+
+# --- Context Compaction ---
+module LLMCompaction
+  module Strategies
+    # Simple FIFO: Keep system messages + last N messages
+    def self.fifo(n: 20)
+      ->(messages) {
+        system_msgs = messages.select { |m| m['role'] == 'system' || m[:role] == 'system' }
+        other_msgs = messages.reject { |m| m['role'] == 'system' || m[:role] == 'system' }
+
+        # Keep last n messages from the conversation history
+        # (System messages are always preserved and don't count against this limit)
+        keep_count = n
+        kept_msgs = other_msgs.last(keep_count)
+
+        system_msgs + kept_msgs
+      }
+    end
+
+    # Summarize: Similar to FIFO, but summarizes dropped messages
+    def self.summarize(n: 20)
+      ->(messages) {
+        system_msgs = messages.select { |m| m['role'] == 'system' || m[:role] == 'system' }
+        other_msgs = messages.reject { |m| m['role'] == 'system' || m[:role] == 'system' }
+
+        keep_count = n
+
+        # nothing to drop?
+        if other_msgs.size <= keep_count
+          return system_msgs + other_msgs
+        end
+
+        kept_msgs = other_msgs.last(keep_count)
+        dropped_msgs = other_msgs.first(other_msgs.size - keep_count)
+
+        # Summarize the dropped messages
+        summary_prompt = "Summarize the following conversation history into a concise paragraph to retain context:\n\n" +
+                         dropped_msgs.map { |m| "#{m['role']}: #{m['content']}" }.join("\n")
+
+        # Recursive call to LLM, but WITHOUT compaction to avoid infinite recursion
+        # using a cheap model.
+        summary_result = llm(summary_prompt, model: "google/gemini-3-flash-preview", compaction: nil)
+
+        summary_msg = { 'role' => 'system', 'content' => "Previous conversation summary: #{summary_result.s}" }
+
+        system_msgs + [summary_msg] + kept_msgs
+      }
+    end
+
+    # Smart Default: Keep system messages + reasonable recent history
+    # We'll use a generous window of 30 messages (approx 10-15 turn conversation)
+    # This is "sensible" for most interactive use cases.
+    def self.standard
+      fifo(n: 30)
+    end
+  end
+
+  def self.apply(strategy, messages)
+    strat = case strategy
+            when nil, :standard then Strategies.standard
+            when :fifo         then Strategies.fifo
+            when :summarize    then Strategies.summarize
+            when Symbol        then Strategies.public_send(strategy) rescue Strategies.standard
+            when Proc          then strategy
+            else Strategies.standard
+            end
+
+    strat.call(messages)
+  end
+end
+
+
+# --- Model Pricing ---
+class ModelPricing
+  @prices = nil
+
+  def self.get_price(model)
+    load_prices unless @prices
+
+    # Default to a safe fallback if model not found (or raise?)
+    # Using a slightly expensive fallback to be safe against infinite loops on cheap budget
+    # Input: $1/1M, Output: $2/1M
+    default = { 'prompt' => 0.000_001, 'completion' => 0.000_002 }
+
+    @prices[model] || default
+  end
+
+  def self.load_prices
+    # 1. Try Memory (already handled by accessor check, but good for explicit reload)
+    return if @prices
+
+    # 2. Try Cache
+    cache_file = "openrouter_prices.json"
+    if (path = LLMCache.find(cache_file))
+      begin
+         data = JSON.parse(File.read(path))
+         # Simple validation: check if it looks like our schema
+         if data.is_a?(Hash) && data.values.first.key?('prompt')
+           @prices = data
+           return
+         end
+      rescue
+         # Corrupt cache, ignore
+      end
+    end
+
+    # 3. Fetch from API
+    fetch_from_api
+  end
+
+  def self.fetch_from_api
+    uri = URI("https://openrouter.ai/api/v1/models")
+    resp = Net::HTTP.get_response(uri)
+
+    unless resp.is_a?(Net::HTTPSuccess)
+      $stderr.puts "Warning: Could not fetch model prices from OpenRouter. Using defaults."
+      @prices = {}
+      return
+    end
+
+    begin
+      json = JSON.parse(resp.body)
+      data = json['data'] # Array of model objects
+
+      new_prices = {}
+      data.each do |item|
+        id = item['id']
+        pricing = item['pricing']
+        if pricing
+          # Pricing is usually strings representing per-token cost?
+          # Or per-1M? OpenRouter docs says "pricing" object has "prompt" and "completion" fields as strings (decimal).
+          # e.g. "0.0000001"
+
+          prompt_price = pricing['prompt'].to_f
+          completion_price = pricing['completion'].to_f
+
+          new_prices[id] = {
+            'prompt' => prompt_price,
+            'completion' => completion_price
+          }
+        end
+      end
+
+      @prices = new_prices
+
+      # Save to cache (regular cache is fine, auto-expires eventually if we had eviction, but here it's persistent)
+      # We don't pin it.
+      LLMCache.write("openrouter_prices.json", @prices.to_json)
+
+    rescue => e
+      $stderr.puts "Warning: Error parsing OpenRouter pricing: #{e.message}"
+      @prices = {}
+    end
+  end
+end
+
+
+# --- Monitoring & Shell Helpers ---
+class GlobalStats
+  class << self
+  attr_accessor :cost, :prompt_tokens, :completion_tokens, :total_tokens, :start_time, :limit
+  end
+  @cost = 0.0
+  @prompt_tokens = 0
+  @completion_tokens = 0
+  @total_tokens = 0
+  @start_time = Time.now
+  @limit = nil
+end
+
+
+class Monitor
+  def self.status=(msg)
+    @status = msg
+    render
+  end
+
+  def self.cost(amount)
+    GlobalStats.cost += amount
+    render
+  end
+
+  def self.tokens(usage)
+    GlobalStats.prompt_tokens += usage['prompt_tokens'].to_i
+    GlobalStats.completion_tokens += usage['completion_tokens'].to_i
+    GlobalStats.total_tokens += usage['total_tokens'].to_i
+    render
+  end
+
+  def self.render
+    cost_str = sprintf("$%.4f", GlobalStats.cost)
+    limit_str = GlobalStats.limit ? sprintf(" / $%.2f", GlobalStats.limit) : ""
+    tok_str = "#{GlobalStats.total_tokens}T"
+    elapsed = Time.now - GlobalStats.start_time
+    time_str = sprintf("%.1fs", elapsed)
+    status_line = "[#{cost_str}#{limit_str} | #{tok_str} | #{time_str}] #{@status} "
+
+    # Save cursor, Move to bottom, Inverse video, Print status, Clear to EOL, Reset attr, Restore cursor
+    $stderr.print "\e7\e[9999H\e[7m#{status_line}\e[K\e[0m\e8"
+    # Ensure flush to make it visible strictly
+    $stderr.flush
+  end
+
+  def self.clear
+    # Save cursor, Move to bottom, Clear line, Restore cursor
+    $stderr.print "\e7\e[9999H\e[K\e8"
+  end
+end
+
+
+module Shell
+  def self.run_stream(cmd)
+    file = Tempfile.new('shell_output')
+    path = file.path
+    file.close
+
+    # Use pipefail to capture exit code of the command.
+    # Must use bash for pipefail.
+    final_cmd = "set -o pipefail; (#{cmd}) 2>&1 | tee #{path}"
+
+    # Invoke bash explicitly
+    system("bash", "-c", final_cmd)
+    status = $?
+
+    output = File.read(path)
+    File.unlink(path) rescue nil
+
+    [output, status]
+  end
+end
+
+
+# --- LLM Result Wrapper ---
+class LLMResult
+  attr_reader :content, :meta, :messages, :llm_args, :schema, :tools
+
+  def initialize(content, meta, messages: [], llm_args: {}, schema: nil, tools: nil)
+    @content = content
+    @meta    = meta    || {}
+
+    @messages = messages || []
+    @llm_args = llm_args || {}
+    @schema = schema
+    @tools = tools
+  end
+
+  def reply(message)
+    # Append new user message to history
+    new_prompt = @messages + [{ role: 'user', content: message }]
+
+    # Call global llm function with history and preserved settings
+    # We pass explicit arguments that might be in llm_args or separate
+    # Note: schema and tools are passed as kwargs to llm, overriding defaults
+    llm(new_prompt, schema: @schema, tools: @tools, **@llm_args)
+  end
+
+  def s
+    @content.is_a?(String) ? @content : @content.to_json
+  end
+
+  def x
+    @content
+  end
+
+  def >(filename)
+    File.write(filename, s)
+    self
+  end
+
+  def |(command)
+    IO.popen(command, 'r+') do |io|
+      io.write(s)
+      io.close_write
+      LLMResult.new(io.read, @meta, messages: @messages, llm_args: @llm_args, schema: @schema, tools: @tools)
+    end
+  end
+
+  def [](key)
+    case key.to_s
+    when 'content' then @content
+    when 'meta' then @meta
+
+    when 'messages' then @messages
+    end
+  end
+
+  def to_h
+    # Including messages in hash representation
+    { 'content' => @content, 'meta' => @meta, 'messages' => @messages }
+  end
+
+  def to_json(*args)
+    to_h.to_json(*args)
+  end
+
+  def to_s
+    s
+  end
+
+  def inspect
+    s_val = s
+    preview = s_val.length > 50 ? s_val[0..50] + "..." : s_val
+    "#<LLMResult: #{preview.inspect}>"
+  end
+end
+
+
+# --- Task Notebook ---
+class TaskNotebook
+  Task = Struct.new(:id, :text, :status)
+
+  attr_reader :tasks
+
+  def initialize
+    @tasks = []
+    @next_id = 1
+  end
+
+  def add(text)
+    id = @next_id
+    @next_id += 1
+    @tasks << Task.new(id, text, :todo)
+    id
+  end
+
+  def update(id, status: nil, text: nil)
+    task = @tasks.find { |t| t.id == id }
+    return "Task #{id} not found" unless task
+
+    task.status = status.to_sym if status
+    task.text = text if text
+    "Task #{id} updated"
+  end
+
+  def to_s
+    return "Task Notebook: (empty)" if @tasks.empty?
+
+    # Group by status for cleaner display
+    todo = @tasks.select { |t| t.status == :todo }
+    wip  = @tasks.select { |t| t.status == :in_progress }
+    done = @tasks.select { |t| t.status == :done }
+
+    lines = ["Task Notebook:"]
+    lines << "  In Progress:" unless wip.empty?
+    wip.each { |t| lines << "    [#{t.id}] #{t.text}" }
+
+    lines << "  To Do:" unless todo.empty?
+    todo.each { |t| lines << "    [#{t.id}] #{t.text}" }
+
+    lines << "  Completed:" unless done.empty?
+    done.each { |t| lines << "    [#{t.id}] #{t.text}" }
+
+    lines.join("\n")
+  end
+end
+
+
+# --- Core LLM Function ---
+# --- Core LLM Function ---
+def llm(prompt, schema: nil, tools: :docker, replay_e2e: false,
+        pin: nil, keep_sandbox: false, into: nil, limit_usd: nil,
+        model: :flash, reasoning_effort: nil, max_tokens: nil,
+        compaction: nil, seed: nil, notebook: nil)
+
+  # Resolve Model Alias
+  model = MODEL_ALIASES[model] || MODEL_ALIASES[model.to_sym] || model
+
+  # Reconstruct arguments hash for internal usage and compatibility
+  llm_args = {
+    pin: pin,
+    keep_sandbox: keep_sandbox,
+    into: into,
+    limit_usd: limit_usd,
+    model: model,
+    reasoning_effort: reasoning_effort,
+    max_tokens: max_tokens,
+    compaction: compaction,
+    seed: seed,
+    notebook: notebook
+  }
+
+  # Resolve tools
+  tools_map = BuiltinTools.resolve(tools)
+
+  # Inject Notebook Tools if notebook is present
+  tools_map = tools_map.merge(BuiltinTools.task_tools(notebook)) if notebook
+
+  # Construct E2E Cache Key
+  tool_keys = tools_map.keys.sort.map(&:to_s)
+
+  # Exclude arguments that don't affect the output content (storage/side-effects)
+  # Also exclude notebook object itself from cache key logic directly unless we serialise it?
+  # Actually, the notebook STATE affects the prompt injection.
+  # If we inject notebook.to_s into the prompt, that part handles the cache variance.
+  # So we don't need to include the notebook object in `cache_args` specifically,
+  # BUT we do need to ensure the INJECTED PROMPT is part of the cache key.
+  # The LLMRunner handles the injection.
+  # Wait, E2E cache key is computed HERE, before runner.
+  # We should include notebook.to_s in the key_data if notebook is present.
+
+  cache_args = llm_args.reject { |k,_| [:pin, :keep_sandbox, :into, :notebook].include?(k) }
+
+  key_data = {
+    prompt: prompt,
+    schema: schema,
+    tools: tool_keys,
+    args: cache_args,
+    notebook_state: notebook ? notebook.to_s : nil
+  }
+
+  e2e_key = Digest::SHA256.hexdigest(key_data.to_json)
+  e2e_filename = "e2e_#{e2e_key}.json"
+
+  # 1. Check E2E Cache
+  if (path = LLMCache.find(e2e_filename)) and not replay_e2e
+    data = JSON.parse(File.read(path))
+    # data from cache should now include messages if available
+    msgs = data['messages'] || []
+    return LLMResult.new(data['content'], data['meta'], messages: msgs, llm_args: llm_args, schema: schema, tools: tools)
+  end
+
+  # 2. Execution Setup
+  sandbox = Sandbox.new(workdir: into)
+
+  if sandbox.persistent?
+    prompt = [{ role: 'system', content: "You are working in a persistent directory '#{sandbox.path}'. Changes will be saved to disk. " +
+                                         "The directory is mounted at '#{sandbox.container_path}' in the container." }] +
+             (prompt.is_a?(Array) ? prompt : [{ role: 'user', content: prompt }])
+  end
+
+  limit_usd = llm_args[:limit_usd]
+  GlobalStats.limit = limit_usd
+  runner = LLMRunner.new(prompt, schema, tools_map, llm_args, sandbox, limit_usd: limit_usd, notebook: notebook)
+
+  begin
+    result = runner.run
+
+    # 3. Write E2E Cache (only on success)
+    cached_data = result
+    LLMCache.write(e2e_filename, cached_data.to_json, pinned: llm_args[:pin])
+    return LLMResult.new(result['content'], result['meta'], messages: result['messages'], llm_args: llm_args, schema: schema, tools: tools)
+  ensure
+    sandbox.cleanup unless llm_args[:keep_sandbox] || sandbox.persistent?
+  end
+end
+
+
+# --- Sandbox Environment ---
+class Sandbox
+  attr_reader :path
+
+  attr_reader :container_path
+
+  def initialize(workdir: nil)
+    if workdir
+      @path = File.expand_path(workdir)
+      FileUtils.mkdir_p(@path)
+      @persistent = true
+      @container_path = "/data"
+    else
+      @path        = Dir.mktmpdir("llm_sandbox_")
+      @persistent  = false
+      @container_path = "/sandbox"
+    end
+
+    @images      = {}
+    @image_count = 0
+    @docker_tags = Set.new
+    @sessions    = {}
+  end
+
+  def persistent?
+    @persistent
+  end
+
+  def cleanup
+    FileUtils.remove_entry(@path) unless @persistent
+    @sessions.each_value(&:stop)
+    @docker_tags.each { |tag| system("docker rmi #{tag}") }
+  end
+
+  def docker_tag
+    tag = nil
+    loop do
+      tag = "sandbox-#{Digest::SHA256.hexdigest(@path + rand.to_s)[0..11]}"
+      break if @docker_tags.add?(tag)
+    end
+    tag
+  end
+
+  def register_image(real_tag)
+    id = "image_#{@image_count}"
+    @image_count += 1
+    @images[id] = real_tag
+    id
+  end
+
+  def resolve_image(name)
+    @images[name] || name
+  end
+
+  # Resolve path within sandbox, ensuring no escape
+  def resolve(filename)
+    clean_path = File.expand_path(filename, @path)
+    unless clean_path.start_with?(@path)
+      raise "Security Error: Attempt to access path outside sandbox: #{filename}"
+    end
+    clean_path
+  end
+
+  def write(filename, content)
+    full_path = resolve(filename)
+    FileUtils.mkdir_p(File.dirname(full_path))
+    File.write(full_path, content)
+  end
+
+  def read(filename)
+    File.read(resolve(filename))
+  end
+
+  def list_files(dir = ".", recursive: false)
+    pattern = recursive ? "**/*" : "*"
+    Dir.glob(File.join(resolve(dir), pattern)).map { |p| p.sub(@path + "/", "") }
+  end
+
+  # --- Session Management ---
+  def start_session(image, command: nil)
+    image = resolve_image(image)
+    id = "session_#{@sessions.size}"
+    @sessions[id] = DockerSession.new(id, image, self, command: command)
+    id
+  end
+
+  def stop_session(id)
+    if (session = @sessions[id])
+      session.stop
+      @sessions.delete(id)
+      "Session #{id} stopped."
+    else
+      "Error: Session #{id} not found."
+    end
+  end
+
+  def get_session(id)
+    @sessions[id]
+  end
+
+  attr_reader :sessions
+end
+
+
+class DockerSession
+  attr_reader :id, :image, :buffer
+
+  def initialize(id, image, sandbox, command: nil)
+    @id = id
+    @image = image
+    @sandbox = sandbox
+    @buffer = []
+    @mutex = Mutex.new
+    @alive = true
+
+    # Default command is bash if not specified
+    command ||= "/bin/bash"
+
+    # docker run -it --rm <image> <command>
+    # We use PTY.spawn to get a real TTY.
+    cmd = "docker run -it --rm -u #{Process.uid}:#{Process.gid} #{image} #{command}"
+
+    # PTY.spawn returns [read_io, write_io, pid]
+    @output_io, @input_io, @pid = PTY.spawn(cmd)
+
+    # We need to turn off strict tty echo maybe?
+    # Or just let it act like a real terminal.
+    # The output will include echo of input if characters are echoed.
+
+    @thread = Thread.new do
+      begin
+        while @alive
+          begin
+            # Read from PTY master
+            # This raises Errno::EIO on Linux when the slave causes EOF (process exit)
+            chunk = @output_io.readpartial(1024)
+            @mutex.synchronize do
+              @buffer << chunk
+              # Optional: limit buffer size?
+            end
+          rescue Errno::EIO
+            # Process finished
+            @alive = false
+            break
+          rescue EOFError
+            @alive = false
+            break
+          end
+        end
+      rescue => e
+        @mutex.synchronize { @buffer << "\n[Error reading output: #{e.message}]\n" }
+      end
+    end
+  end
+
+  def send_input(data)
+    return "Error: Session dead" unless @alive
+    @input_io.write(data)
+    # PTY doesn't strictly need flush usually, but good practice
+    # @input_io.flush rescue nil
+    "Sent #{data.bytesize} bytes"
+  rescue => e
+    "Error sending input: #{e.message}"
+  end
+
+  def read_output
+    @mutex.synchronize do
+      current = @buffer.join
+      @buffer.clear
+      current
+    end
+  end
+
+  def stop
+    @alive = false
+    # Clean shutdown via PTY usually means sending term signal or closing IO
+    # But for docker connection, we might just kill the PID of the spawning process (the docker client)
+    Process.kill("TERM", @pid) rescue nil
+    # Wait a bit?
+    # Process.wait(@pid) rescue nil
+    @output_io.close rescue nil
+    @input_io.close rescue nil
+    @thread.kill
+  end
+end
+
+
+# --- LLM Runner ---
+class LLMRunner
+  attr_reader :total_usage
+
+  def initialize(prompt, schema, tools, llm_args, sandbox, limit_usd: nil, notebook: nil)
+    @messages = prompt.is_a?(Array) ? prompt : [{ role: 'user', content: prompt }]
+    @schema = schema
+    @tools = tools.transform_values { |t| { definition: t, sandbox: sandbox } }
+    @llm_args = llm_args
+    @limit_usd = limit_usd
+    @notebook = notebook
+    @total_usage = {
+      'prompt_tokens' => 0,
+      'completion_tokens' => 0,
+      'total_tokens' => 0,
+      'cost' => 0.0
+    }
+  end
+
+  def run
+    loop do
+      # API Cache Check (Per step)
+      response = cached_api_call(@messages)
+
+      # Aggregate Usage
+      if response['usage']
+        @total_usage['prompt_tokens'] += response['usage']['prompt_tokens'].to_i
+        @total_usage['completion_tokens'] += response['usage']['completion_tokens'].to_i
+        @total_usage['total_tokens'] += response['usage']['total_tokens'].to_i
+        @total_usage['cost'] += response['usage']['cost'].to_f
+
+        Monitor.tokens(response['usage'])
+        Monitor.cost(response['usage']['cost'].to_f)
+      end
+
+      choice = response['choices'][0]
+      message = choice['message']
+      tool_calls = message['tool_calls']
+      content = message['content']
+
+      if tool_calls
+        # Execute tools (NO CACHING for tool execution itself)
+        tool_results = []
+        tool_calls.each do |tc|
+          name = tc['function']['name']
+          args = JSON.parse(tc['function']['arguments'])
+
+          reason = args.delete('reason')
+          Monitor.status = "Tool: #{name} (#{reason})" if reason
+          Monitor.status = "Tool: #{name}" unless reason
+
+          result = execute_tool(name, args)
+          tool_results << { tool_call_id: tc['id'], role: 'tool', name: name, content: result }
+        end
+
+        @messages << message
+        @messages.concat(tool_results)
+      else
+        # Final answer
+        @messages << message
+        result_content = content
+        if @schema
+          begin
+             result_content = JSON.parse(content)
+          rescue
+             # keep as string if parse fails
+          end
+        end
+
+        # Return wrapped result
+        return {
+          'content' => result_content,
+          'messages' => @messages,
+          'meta' => {
+            'usage' => @total_usage,
+            'history_count' => @messages.count
+          }
+        }
+      end
+    end
+  ensure
+    Monitor.clear
+  end
+
+  def cached_api_call(messages)
+    # Apply compaction strategy to the VIEW of messages we send to the API.
+    # The @messages in the runner state remains full history.
+    compacted_messages = LLMCompaction.apply(@llm_args[:compaction], messages)
+
+    # Inject Notebook System Prompt if notebook is present
+    if @notebook
+      # Insert at the beginning, or after the very first system prompt?
+      # Let's put it as the FIRST system prompt to ensure it's seen.
+      # Or just prepend it.
+      notebook_prompt = { role: 'system', content: @notebook.to_s + "\n(Use task_add/task_update tools to manage this list)" }
+      compacted_messages = [notebook_prompt] + compacted_messages
+    end
+
+    # Cache key based on (compacted) messages + schema + tool defs + all generation args
+    # matching the E2E cache logic (exclude :pin, :keep_sandbox)
+    cache_args = @llm_args.reject { |k,_| [:pin, :keep_sandbox, :into, :notebook].include?(k) }
+
+    key_def = {
+      messages: compacted_messages,
+      schema: @schema,
+      tools: @tools.keys.sort,
+      args: cache_args
+    }
+    key = Digest::SHA256.hexdigest(key_def.to_json)
+    filename = "api_#{key}.json"
+
+    if (path = LLMCache.find(filename))
+       return JSON.parse(File.read(path))
+    end
+
+    result = call_openrouter(compacted_messages)
+    LLMCache.write(filename, result.to_json, pinned: @llm_args[:pin])
+    result
+  end
+
+  def execute_tool(name, args)
+    tool_entry = @tools[name] || @tools[name.to_sym]
+    return "Error: Tool #{name} not found" unless tool_entry
+
+    definition = tool_entry[:definition]
+    sandbox = tool_entry[:sandbox]
+
+    impl = definition.is_a?(Hash) && definition[:implementation] ? definition[:implementation] : definition
+
+    begin
+      if impl.arity == 2
+        # Check if 2 args. If implementation is a lambda/proc, arity might be flexible?
+        # Standardize on (args) or (args, sandbox)
+        # But wait, Builtin task tools only take (args), no sandbox involved.
+        # How do we handle tools that don't need sandbox?
+        # The tool definition wrapper above passes sandbox regardless?
+        # No, look at @tools = tools.transform_values { |t| { definition: t, sandbox: sandbox } }
+        # And impl.call(args, sandbox) vs impl.call(args)
+        # Ruby's arity for blocks:
+        # ->(a,b){} arity is 2
+        # ->(a){} arity is 1
+        output = impl.call(args, sandbox)
+      else
+        output = impl.call(args)
+      end
+    rescue => e
+      output = "Error executing #{name}: #{e.message}\n#{e.backtrace.first(5).join("\n")}"
+    end
+
+    output.is_a?(String) ? output : output.to_json
+  end
+
+  def call_openrouter(messages)
+    api_key = ENV['OPENROUTER_API_KEY']
+    unless api_key
+      return { 'choices' => [{ 'message' => { 'content' => 'Error: Missing OPENROUTER_API_KEY' } }], 'usage' => {} }
+    end
+
+    model = @llm_args[:model] || "google/gemini-3-pro-preview"
+
+    uri = URI("https://openrouter.ai/api/v1/chat/completions")
+    req = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json', 'Authorization' => "Bearer #{api_key}")
+
+    # Transform tools for OpenAI format
+    openai_tools = nil
+    if @tools.any?
+      openai_tools = @tools.map do |name, entry|
+        defin = entry[:definition]
+        schema = defin.is_a?(Hash) ? defin[:schema] : nil
+        unless schema
+           schema = { description: "Execute #{name}", parameters: { type: "object", properties: {}, additionalProperties: true } }
+        end
+
+        tool_def = {
+          type: "function",
+          function: {
+            name: name.to_s,
+            description: schema[:description],
+            parameters: schema[:parameters]
+          }
+        }
+
+        # Inject "reason" parameter
+        params = tool_def[:function][:parameters]
+        params[:properties] ||= {}
+        params[:properties][:reason] = { type: "string", description: "Why you are calling this tool" }
+        params[:required] ||= []
+        params[:required] << "reason" unless params[:required].include?("reason")
+
+        tool_def
+      end
+    end
+
+    Monitor.status = "Thinking..."
+
+    body = {
+      model: model,
+      messages: messages,
+      stream: true
+    }
+
+    # Add reasoning_effort if specified (e.g. for o1 models)
+    if @llm_args[:reasoning_effort]
+      body[:reasoning_effort] = @llm_args[:reasoning_effort]
+    end
+
+
+
+    if @llm_args[:seed]
+      body[:seed] = @llm_args[:seed].to_i
+    end
+
+    pricing = ModelPricing.get_price(model)
+
+    # Estimate prompt tokens for budget and live monitoring
+    # Simple heuristic: 4 chars per token for all messages
+    full_text = messages.map { |m| (m['content'] || m[:content]).to_s + (m['tool_calls'] || m[:tool_calls] || []).to_s }.join
+    estimated_prompt_tokens = (full_text.length / 4.0).ceil
+
+    # Track what we have added to GlobalStats so we can reconcile later
+    @reported_prompt_tokens = estimated_prompt_tokens
+    @reported_completion_tokens = 0
+    @reported_cost = estimated_prompt_tokens * pricing['prompt']
+
+    # Update GlobalStats with initial prompt estimate
+    GlobalStats.prompt_tokens += @reported_prompt_tokens
+    GlobalStats.total_tokens += @reported_prompt_tokens
+    GlobalStats.cost += @reported_cost
+    Monitor.render
+
+    # Budget Logic
+    if @limit_usd
+      current_total_cost = GlobalStats.cost # Use the global cost which now includes our estimate
+
+      remaining_budget = @limit_usd - current_total_cost
+
+      if remaining_budget <= 0
+        raise "Budget Exceeded: Limit $#{@limit_usd}, Estimated Cost $#{current_total_cost.round(6)}"
+      end
+
+      # Calculate max completion tokens allowed
+      max_allowed = (remaining_budget / pricing['completion']).floor
+
+      # Safety buffer: ensure we don't ask for < 1 token
+      max_allowed = 1 if max_allowed < 1
+
+      # Cap at a reasonable maximum (e.g. 64k) to avoid 400 Bad Request regarding context limits
+      max_allowed = 65536 if max_allowed > 65536
+
+      # Use the stricter of the user's max_tokens or our budget limit
+      user_max = @llm_args[:max_tokens]
+      final_max = user_max ? [user_max, max_allowed].min : max_allowed
+
+      body[:max_tokens] = final_max
+    elsif @llm_args[:max_tokens]
+      body[:max_tokens] = @llm_args[:max_tokens]
+    end
+
+    body[:tools] = openai_tools if openai_tools
+    body[:response_format] = { type: 'json_object' } if @schema
+
+    req.body = body.to_json
+
+    # Aggregated response structure
+    final_content = ""
+    final_reasoning = ""
+    final_reasoning_details = nil
+    final_tool_calls = {}
+    final_usage = nil
+    finish_reason = nil
+
+    buffer = ""
+
+    # Helpers for live updates
+    token_accumulator = 0.0
+
+    retries = 0
+    begin
+      Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+        http.request(req) do |response|
+          if response.code.start_with?("5")
+            raise "Transient Error: #{response.code} #{response.message}"
+          end
+
+          unless response.is_a?(Net::HTTPSuccess)
+            error_body = response.body rescue "Could not read error body"
+            raise "OpenRouter Error: #{response.code} #{response.message} - #{error_body}"
+          end
+
+          response.read_body do |chunk|
+            buffer << chunk
+            while (newline_index = buffer.index("\n"))
+              line = buffer.slice!(0, newline_index + 1).strip
+              next if line.empty?
+
+              if line.start_with?("data: ")
+                data_str = line[6..-1].strip
+                next if data_str == "[DONE]"
+
+                begin
+                  data = JSON.parse(data_str)
+
+                  # 1. Handle Usage (Correction/Final)
+                  if data['usage']
+                    final_usage = data['usage']
+
+                    # Reconcile what we estimated vs what is real
+                    real_prompt = final_usage['prompt_tokens'].to_i
+                    real_completion = final_usage['completion_tokens'].to_i
+                    real_total = final_usage['total_tokens'].to_i
+
+                    # OpenRouter often sends usage at the end.
+
+                    # Calculate diffs
+                    diff_prompt = real_prompt - @reported_prompt_tokens
+                    diff_completion = real_completion - @reported_completion_tokens
+
+                    # Update tokens
+                    GlobalStats.prompt_tokens += diff_prompt
+                    GlobalStats.completion_tokens += diff_completion
+                    GlobalStats.total_tokens = GlobalStats.prompt_tokens + GlobalStats.completion_tokens # Reset to sum
+
+                    # Update cost
+                    # Recalculate exact cost
+                    real_cost = (real_prompt * pricing['prompt']) + (real_completion * pricing['completion'])
+                    diff_cost = real_cost - @reported_cost
+
+                    GlobalStats.cost += diff_cost
+
+                    # Update internal state so we don't re-apply
+                    @reported_prompt_tokens = real_prompt
+                    @reported_completion_tokens = real_completion
+                    @reported_cost = real_cost
+
+                    Monitor.render
+                  end
+
+                  if data['choices'] && data['choices'].any?
+                    choice = data['choices'][0]
+                    if choice['finish_reason']
+                      finish_reason = choice['finish_reason']
+                      $stderr.print "\e[35m[STOP: #{finish_reason}]\e[0m"
+                    end
+                    delta = choice['delta']
+
+                    # 2. Handle Content & Live Estimation
+                    est_tokens = 0
+
+                    if delta['content']
+                      part = delta['content']
+                      final_content << part
+                      $stderr.print part
+                      est_tokens += (part.length / 4.0)
+                    end
+
+                    if delta['reasoning']
+                      part = delta['reasoning']
+                      final_reasoning << part
+                      $stderr.print "\e[33m#{part}\e[0m" # Yellow for reasoning
+                      est_tokens += (part.length / 4.0)
+                    end
+
+                    if delta['reasoning_details']
+                      final_reasoning_details ||= []
+                      final_reasoning_details.concat(delta['reasoning_details'])
+                    end
+
+                    if est_tokens > 0
+                      token_accumulator += est_tokens
+                      if token_accumulator >= 1.0
+                         added = token_accumulator.floor
+                         token_accumulator -= added
+
+                         GlobalStats.completion_tokens += added
+                         GlobalStats.total_tokens += added
+                         cost_delta = added * pricing['completion']
+                         GlobalStats.cost += cost_delta
+
+                         @reported_completion_tokens += added
+                         @reported_cost += cost_delta
+
+                         Monitor.render
+                      end
+                    end
+
+                    # Handling Tool Calls
+                    if delta['tool_calls']
+                      delta['tool_calls'].each do |tc|
+                        idx = tc['index']
+                        final_tool_calls[idx] ||= { 'id' => '', 'type' => 'function', 'function' => { 'name' => '', 'arguments' => '' } }
+                        final_tool_calls[idx]['id'] << tc['id'] if tc['id']
+                        if tc['function']
+                           if tc['function']['name']
+                             name = tc['function']['name']
+                             final_tool_calls[idx]['function']['name'] << name
+                             Monitor.status = "Tool Call: #{name}"
+                           end
+                           final_tool_calls[idx]['function']['arguments'] << tc['function']['arguments'] if tc['function']['arguments']
+                        end
+                      end
+                      # Ensure status update for tool calls
+                       Monitor.render
+                    end
+                  end
+                rescue JSON::ParserError
+                  # Incomplete JSON line? Should be complete if we split by newline but handle gracefully
+                end
+              end
+            end
+          end
+        end
+      end
+    rescue Errno::ECONNRESET, Errno::ETIMEDOUT, Errno::ECONNREFUSED, Net::ReadTimeout, Net::OpenTimeout, OpenSSL::SSL::SSLError, SocketError, RuntimeError => e
+      # Check if it is distinctively a transient error (including our custom 5xx raise)
+      # We matched specific errnos, but RuntimeError needs checking
+      is_transient = e.message.start_with?("Transient Error") ||
+                     e.is_a?(Errno::ECONNRESET) || e.is_a?(Errno::ETIMEDOUT) || e.is_a?(Errno::ECONNREFUSED) ||
+                     e.is_a?(Net::ReadTimeout) || e.is_a?(Net::OpenTimeout) ||
+                     e.is_a?(OpenSSL::SSL::SSLError) || e.is_a?(SocketError)
+
+      if is_transient && retries < 5
+        retries += 1
+        delay = retries ** 2
+        $stderr.puts "\n\e[31m[!] Transient Error: #{e.message}. Retrying in #{delay}s... (Attempt #{retries}/5)\e[0m"
+        sleep delay
+        retry
+      else
+        raise e
+      end
+    end
+
+    $stderr.print "\n" # Newline after streaming content
+
+    # Construct final response object
+    choices = [{
+      'message' => {
+        'role' => 'assistant',
+        'content' => final_content.empty? ? nil : final_content,
+        'reasoning' => final_reasoning.empty? ? nil : final_reasoning,
+        'reasoning_details' => final_reasoning_details,
+        'tool_calls' => final_tool_calls.empty? ? nil : final_tool_calls.values
+      },
+      'finish_reason' => finish_reason
+    }]
+
+    { 'choices' => choices, 'usage' => final_usage || {} }
+  end
+end
+
+
+# --- Interaction Helper ---
+def i(result)
+  puts "\n=== INTERACTION OUTPUT ==="
+  if result.respond_to?(:s) && result.respond_to?(:meta)
+    puts "Content: #{result.s}"
+    puts "Meta: #{JSON.pretty_generate(result.meta)}"
+  elsif result.is_a?(Hash) && result['content']
+    puts "Content: #{result['content']}"
+    puts "Meta: #{JSON.pretty_generate(result['meta'])}"
+  elsif result.is_a?(String)
+    puts result
+  elsif result.is_a?(LLMResult)
+    puts "Content: #{result.s}"
+    puts "Meta: #{JSON.pretty_generate(result.meta)}"
+  else
+    puts YAML.dump(result)
+  end
+  puts "=========================="
+
+  exit
+end
+
+
+# --- String Extension ---
+class String
+  def llm_get(instruction)
+    llm(self + "\n" + instruction, model: "google/gemini-3-flash-preview")
+  end
+end
+
+
+# --- Built-in Tools Module ---
+module BuiltinTools
+  def self.basic_tools
+    {
+      'ls' => {
+        implementation: ->(args, sandbox) {
+          path = args['path'] || "."
+          recursive = args.key?('recursive') ? args['recursive'] : true
+          begin
+            files = sandbox.list_files(path, recursive: recursive)
+            files.empty? ? "(empty directory)" : files.join("\n")
+          rescue => e
+            "Error: #{e.message}"
+          end
+        },
+        schema: {
+          description: "List files in the sandbox directory (or within a subpath)",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "subpath to list, default ./ (the sandbox root)" },
+              recursive: { type: "boolean", description: "List files recursively? Default: true" }
+            }
+          }
+        }
+      },
+      'read_file' => {
+        implementation: ->(args, sandbox) {
+          sandbox.read(args['path'])
+        },
+        schema: {
+          description: "Read a file from the sandbox",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        }
+      },
+      'read_lines' => {
+        implementation: ->(args, sandbox) {
+          path = args['path']
+          start_line = (args['start_line'] || 1).to_i
+          end_line = args['end_line'] ? args['end_line'].to_i : nil
+
+          begin
+            content = sandbox.read(path)
+            lines = content.lines
+
+            # Adjust for 1-based indexing
+            # start_line 1 means index 0
+            start_idx = [0, start_line - 1].max
+
+            if end_line
+               end_idx = [lines.size, end_line].min - 1
+               # If range is invalid or empty
+               return "" if start_idx > end_idx
+               slice = lines[start_idx..end_idx]
+               current_line_num = start_idx + 1
+            else
+               return "" if start_idx >= lines.size
+               slice = lines[start_idx..-1]
+               current_line_num = start_idx + 1
+            end
+
+            output = []
+            slice.each do |line|
+              output << "#{current_line_num}: #{line}"
+              current_line_num += 1
+            end
+            output.join
+          rescue => e
+            "Error: #{e.message}"
+          end
+        },
+        schema: {
+          description: "Read a file with line numbers. Optionally specify a line range.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              start_line: { type: "integer", description: "Start reading from this line (1-based, inclusive)" },
+              end_line: { type: "integer", description: "Stop reading at this line (1-based, inclusive)" }
+            },
+            required: ["path"]
+          }
+        }
+      },
+      'write_file' => {
+        implementation: ->(args, sandbox) {
+          sandbox.write(args['path'], args['content'])
+          "Wrote #{args['content'].size} bytes to #{args['path']}"
+        },
+        schema: {
+          description: "Write content to a file in the sandbox",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              content: { type: "string" }
+            },
+            required: ["path", "content"]
+          }
+        }
+      },
+      'write_lines' => {
+        implementation: ->(args, sandbox) {
+          path = args['path']
+          provided_line = args['line'].to_i
+          new_content = args['content']
+          context = args['context']
+
+          begin
+            full_content = sandbox.read(path)
+            lines = full_content.lines
+
+            # --- Context Alignment & Safety ---
+            if context.nil? || context.empty?
+               return "Error: 'context' is required for write_lines to verify the change location."
+            end
+
+            context_lines = context.lines
+            match_target = context_lines.map(&:strip)
+
+            # Start search at provided line (1-based -> 0-based)
+            target_idx = [0, provided_line - 1].max
+
+            # Definition of a match at index i
+            matches_at = ->(i) {
+               return false if i < 0
+               return false if i + match_target.size > lines.size
+               match_target.each_with_index do |target_line, offset|
+                 return false unless lines[i + offset].strip == target_line
+               end
+               true
+            }
+
+            final_idx = nil
+
+            # 1. Check exact location
+            if matches_at.call(target_idx)
+              final_idx = target_idx
+            else
+              # 2. Search window (+/- 20 lines)
+              window = 20
+              min_search = [0, target_idx - window].max
+              max_search = [lines.size - match_target.size, target_idx + window].min
+
+              candidates = []
+              (min_search..max_search).each do |i|
+                candidates << i if matches_at.call(i)
+              end
+
+              if candidates.empty?
+                 return "Error: Context not found near line #{provided_line}. Please ensure the context exactly matches the existing file content (ignoring whitespace)."
+              end
+
+              # Pick closest candidate
+              final_idx = candidates.min_by { |i| (i - target_idx).abs }
+            end
+
+            # --- Perform Replacement ---
+            new_lines_arr = new_content.lines
+
+            # We replace exactly the lines matched by context
+            # This allows growing or shrinking the block
+            lines[final_idx, context_lines.size] = new_lines_arr
+
+            updated_content = lines.join
+            sandbox.write(path, updated_content)
+
+            msg = "Updated #{path}."
+            if final_idx != target_idx
+               msg += " Note: Aligned start line from #{provided_line} to #{final_idx + 1} based on context."
+            end
+            msg
+          rescue => e
+            "Error: #{e.message}"
+          end
+        },
+        schema: {
+          description: "Robustly overwrite specific lines. Requires 'context' to locate and verify the block to be replaced.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              line: { type: "integer", description: "Estimated 1-based start line of the block" },
+              content: { type: "string", description: "New content to replace the block with" },
+              context: { type: "string", description: "The EXACT content of the lines to be replaced (for verification and alignment)" }
+            },
+            required: ["path", "line", "content", "context"]
+          }
+        },
+      },
+      'delegate_to_flash_preview' => {
+          implementation: ->(args, sandbox) {
+            path = args['path']
+            instruction = args['instruction']
+
+            begin
+              file_content = sandbox.read(path)
+
+              prompt = <<~PROMPT
+                You are a helpful coding assistant.
+
+                FILE: #{path}
+                ```
+                #{file_content}
+                ```
+
+                INSTRUCTION: #{instruction}
+
+                Please output the NEW content of the file based on the instruction.
+                Do not include markdown code block fencing (```). Just the raw file content.
+                If you must explain, put it in a separate block, but ideally just return the content.
+              PROMPT
+
+              # Call Flash model
+              # We use the global `llm` function. Since we are inside the `llm` library validation,
+              # we can call it. We disable tools for this call to keep it simple and pure text.
+              # We disable compaction to ensure full context of this atomic task.
+              result = llm(prompt, model: "google/gemini-3-flash-preview", tools: {}, compaction: nil)
+
+              new_content = result.s.strip
+              # Strip markdown fences if present (sometimes models add them despite instructions)
+              if new_content.start_with?("```")
+                new_content = new_content.lines.drop(1)
+                new_content.pop if new_content.last&.strip == "```"
+                new_content = new_content.join
+              end
+
+              preview_path = path + ".flash_preview"
+              sandbox.write(preview_path, new_content)
+
+              # Diff
+              # Run diff command inside sandbox (or via shell helper)
+              # But sandbox.path is the root.
+              full_path = sandbox.resolve(path)
+              full_preview_path = sandbox.resolve(preview_path)
+
+              diff_cmd = "diff -u #{full_path} #{full_preview_path}"
+              output, status = Shell.run_stream(diff_cmd)
+
+              if output.strip.empty?
+                "No changes generated (diff empty). Preview saved to #{preview_path}."
+              else
+                "Changes delegated to Flash. Preview saved to #{preview_path}.\n\nDiff:\n#{output}"
+              end
+
+            rescue => e
+              "Error delegating to flash: #{e.message}\n#{e.backtrace.join("\n")}"
+            end
+          },
+          schema: {
+            description: "Delegate a file edit to Google Gemini Flash (faster/cheaper). Creates a .flash_preview file and returns a diff.",
+            parameters: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "Path to the file to edit" },
+                instruction: { type: "string", description: "Instruction for the edit" }
+              },
+              required: ["path", "instruction"]
+            }
+          }
+        },
+      'ask_file' => {
+          implementation: ->(args, sandbox) {
+            path = args['path']
+            question = args['question']
+
+            begin
+              file_content = sandbox.read(path)
+
+              prompt = <<~PROMPT
+                You are a helpful coding assistant.
+
+                FILE: #{path}
+                ```
+                #{file_content}
+                ```
+
+                QUESTION: #{question}
+
+                Please answer the question based on the file content.
+              PROMPT
+
+              # Call Flash model
+              # Disable tools and compaction for this focused query
+              result = llm(prompt, model: "google/gemini-3-flash-preview", tools: {}, compaction: nil)
+
+              result.s
+            rescue => e
+              "Error querying file: #{e.message}"
+            end
+          },
+          schema: {
+            description: "Ask a question about a file using Gemini Flash (faster/cheaper).",
+            parameters: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "Path to the file to query" },
+                question: { type: "string", description: "The question to ask about the file" }
+              },
+              required: ["path", "question"]
+            }
+          }
+        },
+        'docker_start' => {
+          implementation: ->(args, sandbox) {
+            sandbox.start_session(args['image'], command: args['command'])
+          },
+          schema: {
+            description: "Start a persistent Docker session. Returns a session ID.",
+            parameters: {
+              type: "object",
+              properties: {
+                image: { type: "string", description: "Image name or tag" },
+                command: { type: "string", description: "Command to run (default: /bin/bash)" }
+              },
+              required: ["image"]
+            }
+          }
+        },
+        'docker_stop' => {
+          implementation: ->(args, sandbox) {
+            sandbox.stop_session(args['session_id'])
+          },
+          schema: {
+            description: "Stop a persistent Docker session.",
+            parameters: {
+              type: "object",
+              properties: {
+                session_id: { type: "string" }
+              },
+              required: ["session_id"]
+            }
+          }
+        },
+        'docker_input' => {
+          implementation: ->(args, sandbox) {
+            session = sandbox.get_session(args['session_id'])
+            return "Error: Session not found" unless session
+            session.send_input(args['input'])
+          },
+          schema: {
+            description: "Send input (stdin) to a docker session.",
+            parameters: {
+              type: "object",
+              properties: {
+                session_id: { type: "string" },
+                input: { type: "string" }
+              },
+              required: ["session_id", "input"]
+            }
+          }
+        },
+        'docker_logs' => {
+          implementation: ->(args, sandbox) {
+            session = sandbox.get_session(args['session_id'])
+            return "Error: Session not found" unless session
+            session.read_output
+          },
+          schema: {
+            description: "Read recent output (stdout/stderr) from the docker session.",
+            parameters: {
+              type: "object",
+              properties: {
+                session_id: { type: "string" }
+              },
+              required: ["session_id"]
+            }
+          }
+        },
+      'grep' => {
+        implementation: ->(args, sandbox) {
+          regex = Regexp.new(args['regex'])
+          path = args['path'] || "."
+          # Safe grep inside sandbox
+          full_path = sandbox.resolve(path)
+          results = []
+          limit = 50
+          match_count = 0
+          truncated = false
+
+          # Recursive search if directory, else file
+          files = File.directory?(full_path) ? Dir.glob(File.join(full_path, "**/*")) : [full_path]
+
+          catch :limit_reached do
+            files.each do |f|
+              next unless File.file?(f)
+              begin
+                file_lines = File.readlines(f)
+                file_lines.each_with_index do |line, i|
+                  if line.match?(regex)
+                     start_ctx = [0, i - 2].max
+                     end_ctx = [file_lines.size - 1, i + 2].min
+
+                     context_block = (start_ctx..end_ctx).map do |ctx_i|
+                       marker = (ctx_i == i) ? ">" : " "
+                       "#{f.sub(sandbox.path + '/', '')}:#{ctx_i+1}:#{marker} #{file_lines[ctx_i].strip}"
+                     end.join("\n")
+
+                     results << context_block
+                     results << "---"
+
+                     match_count += 1
+                     if match_count >= limit
+                       truncated = true
+                       throw :limit_reached
+                     end
+                  end
+                end
+              rescue
+                # ignore read errors
+              end
+            end
+          end
+
+          output = results.empty? ? "(no matches)" : results.join("\n")
+          output += "\n... (truncated after #{limit} matches)" if truncated
+          output
+        },
+        schema: {
+          description: "Search for regex in files within the sandbox",
+          parameters: {
+            type: "object",
+            properties: { regex: { type: "string" }, path: { type: "string" } },
+            required: ["regex"]
+          }
+        }
+      }
+    }
+  end
+
+  def self.format_shell_output(output, status, sandbox, command_type: "Command")
+    log_filename = "log.txt"
+    sandbox.write(log_filename, output)
+
+    line_count = output.lines.count
+    if line_count <= 50
+      return output
+    else
+      tail = output.lines.last(50).join
+      return "[exit status: #{status.exitstatus}] #{line_count} total lines saved into `#{log_filename}`. Final lines:\n#{tail}"
+    end
+  end
+
+  def self.docker_tools
+    basic_tools.merge({
+      'docker_run' => {
+         implementation: ->(args, sandbox) {
+          image = args['image'] || 'alpine'
+          cmd = args['command'] || 'echo hello'
+
+          mount_arg = "-v #{sandbox.path}:#{sandbox.container_path} -w #{sandbox.container_path}"
+          File.write("#{sandbox.path}/.cmd", cmd)
+
+          # Use Shell module to stream output
+          real_image = sandbox.resolve_image(image)
+          full_cmd = "docker run --rm -u #{Process.uid}:#{Process.gid} #{mount_arg} #{real_image} sh #{sandbox.container_path}/.cmd"
+          output, status = Shell.run_stream(full_cmd)
+
+          if status.success?
+            BuiltinTools.format_shell_output(output, status, sandbox, command_type: "Docker Run")
+          else
+            "Docker Error (Exit #{status.exitstatus}): #{output}"
+          end
+        },
+        schema: {
+          description: "Run a command in a Docker container with sandbox mounted",
+          parameters: {
+             type: "object",
+             properties: {
+               image: { type: "string" },
+               command: { type: "string" }
+             },
+             required: ["image", "command"]
+          }
+        }
+      },
+      'docker_build' => {
+        implementation: ->(args, sandbox) {
+          path = args['dockerfile_path']
+
+          image_id = sandbox.docker_tag
+          full_cmd = "docker build #{sandbox.path} -f #{sandbox.path}/#{path} -t #{image_id}"
+          output, status = Shell.run_stream(full_cmd)
+
+          if status.success?
+            sandbox.register_image(image_id)
+            BuiltinTools.format_shell_output(output, status, sandbox, command_type: "Docker Build")
+          else
+            "Build Failed: #{output}"
+          end
+        },
+        schema: {
+          description: "Build a Docker image from a Dockerfile path (which should be a file in the sandbox)",
+          parameters: {
+            type: "object",
+            properties: { dockerfile_path: { type: "string" } },
+            required: ["dockerfile_path"]
+          }
+        }
+      },
+    })
+  end
+
+  def self.task_tools(notebook)
+    {
+      'task_add' => {
+        implementation: ->(args) {
+          id = notebook.add(args['text'])
+          "Added task [#{id}]: #{args['text']}"
+        },
+        schema: {
+          description: "Add a new task to the notebook",
+          parameters: {
+            type: "object",
+            properties: { text: { type: "string" } },
+            required: ["text"]
+          }
+        }
+      },
+      'task_update' => {
+        implementation: ->(args) {
+          status = args['status']
+          text = args['text']
+          notebook.update(args['id'].to_i, status: status, text: text)
+        },
+        schema: {
+          description: "Update an existing task in the notebook",
+          parameters: {
+            type: "object",
+            properties: {
+              id: { type: "integer" },
+              status: { type: "string", enum: ["todo", "in_progress", "done"], description: "New status" },
+              text: { type: "string", description: "Updated task description" }
+            },
+            required: ["id"]
+          }
+        }
+      }
+    }
+  end
+
+  def self.resolve(tools)
+    case tools
+    when :docker
+      docker_tools
+    when :basic
+      basic_tools
+    when Symbol
+      # Fallback/Error for unknown symbols?
+      # For now, let's assume if it's not known, it's empty or raises.
+      # User asked for "alias tools: :docker", so supporting just that and basic is fine.
+      raise "Unknown tool set: #{tools}"
+    when Array
+      tools.reduce({}) { |acc, t| acc.merge(resolve(t)) }
+    when nil
+      {}
+    else
+      # Assume Hash-like
+      tools
+    end
+  end
+end
+
+
+# --- Interpreter Mode ---
+if __FILE__ == $0
+  if ARGV[0]
+    load ARGV[0]
+  end
+end
