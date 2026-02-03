@@ -42,5 +42,12 @@ EOF
 ```
 
 
+## Examples
++ [examples/tmux.rb](examples/tmux.rb)
++ [examples/jitgrep.rb](examples/jitgrep.rb)
+
+
 ## Documentation
 Helpfully written by Gemini in [doc/llm.md](doc/llm.md).
+
+For background, you may want to read [doc/api.md](doc/api.md), which contains an example OpenRouter API call and response.

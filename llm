@@ -79,42 +79,81 @@ module LLMCompaction
         system_msgs = messages.select { |m| m['role'] == 'system' || m[:role] == 'system' }
         other_msgs = messages.reject { |m| m['role'] == 'system' || m[:role] == 'system' }
 
-        # Keep last n messages from the conversation history
-        # (System messages are always preserved and don't count against this limit)
-        keep_count = n
-        kept_msgs = other_msgs.last(keep_count)
+        # Filter out pinned
+        pinned_msgs = other_msgs.select { |m| m['pinned'] || m[:pinned] }
+        unpinned_msgs = other_msgs.reject { |m| m['pinned'] || m[:pinned] }
 
-        system_msgs + kept_msgs
+        keep_count = n
+        kept_unpinned = unpinned_msgs.last(keep_count)
+
+        system_msgs + pinned_msgs + kept_unpinned
       }
     end
 
-    # Summarize: Similar to FIFO, but summarizes dropped messages
+    # Summarize: Rolling summary of dropped messages
     def self.summarize(n: 20)
       ->(messages) {
+        # Separate system messages and regular messages
         system_msgs = messages.select { |m| m['role'] == 'system' || m[:role] == 'system' }
         other_msgs = messages.reject { |m| m['role'] == 'system' || m[:role] == 'system' }
 
+        # Filter out pinned messages from other_msgs so they are never dropped
+        pinned_msgs = other_msgs.select { |m| m['pinned'] || m[:pinned] }
+        unpinned_msgs = other_msgs.reject { |m| m['pinned'] || m[:pinned] }
+
         keep_count = n
 
-        # nothing to drop?
-        if other_msgs.size <= keep_count
+        # nothing to drop from unpinned?
+        if unpinned_msgs.size <= keep_count
           return system_msgs + other_msgs
         end
 
-        kept_msgs = other_msgs.last(keep_count)
-        dropped_msgs = other_msgs.first(other_msgs.size - keep_count)
+        # Drop oldest unpinned messages
+        kept_unpinned = unpinned_msgs.last(keep_count)
+        dropped_msgs = unpinned_msgs.first(unpinned_msgs.size - keep_count)
 
-        # Summarize the dropped messages
-        summary_prompt = "Summarize the following conversation history into a concise paragraph to retain context:\n\n" +
-                         dropped_msgs.map { |m| "#{m['role']}: #{m['content']}" }.join("\n")
+        # Reconstruct kept list (preserving relative order if possible, but simplest is pinned + kept_unpinned)
+        # Ideally we'd keep them in time-order, but standard compaction usually just keeps tail.
+        # We'll stick to appending kept_unpinned.
+        # Note: pinned messages might be "old", but we keep them.
+        # To maintain some semblance of order, we might need a more complex sort,
+        # but for now, just gathering all kept pieces is sufficient.
 
-        # Recursive call to LLM, but WITHOUT compaction to avoid infinite recursion
-        # using a cheap model.
-        summary_result = llm(summary_prompt, model: "google/gemini-3-flash-preview", compaction: nil)
+        # Identify if we already have a focused summary
+        previous_summary_msg = system_msgs.find { |m| (m['content'] || m[:content]).to_s.start_with?("Previous conversation summary:") }
+        other_system_msgs = system_msgs.reject { |m| m == previous_summary_msg }
 
-        summary_msg = { 'role' => 'system', 'content' => "Previous conversation summary: #{summary_result.s}" }
+        old_summary_text = ""
+        if previous_summary_msg
+          old_summary_text = (previous_summary_msg['content'] || previous_summary_msg[:content]).sub("Previous conversation summary: ", "")
+        end
 
-        system_msgs + [summary_msg] + kept_msgs
+        # Summarize the diff (old summary + newly dropped)
+        # We don't want to just carry over the old summary text blindly if it gets too stale,
+        # but re-summarizing everything is the "Rolling" strategy.
+
+        prompt_content = "Update the conversation summary to include the following new information. " +
+                         "Keep the summary concise and focused on facts, user preferences, and key decisions.\n\n"
+
+        if !old_summary_text.empty?
+          prompt_content += "EXISTING SUMMARY:\n#{old_summary_text}\n\n"
+        end
+
+        prompt_content += "NEWLY DROPPED MESSAGES:\n" +
+                          dropped_msgs.map { |m| "#{m['role']}: #{m['content']}" }.join("\n")
+
+        # Recursive call to LLM suitable for summarization
+        # Disable tools and compaction
+        summary_result = llm(prompt_content, model: "google/gemini-3-flash-preview", compaction: nil, tools: {})
+
+        new_summary_text = summary_result.s
+        new_summary_msg = { 'role' => 'system', 'content' => "Previous conversation summary: #{new_summary_text}" }
+
+        # Final list: Other System Msgs + [New Summary] + Pinned Msgs + Kept Unpinned
+        # We place pinned messages before recent history? Or maybe just mixed in?
+        # Since we lost their original index, appending them before kept_unpinned is reasonable logic for "important context".
+
+        other_system_msgs + [new_summary_msg] + pinned_msgs + kept_unpinned
       }
     end
 
@@ -431,7 +470,7 @@ end
 def llm(prompt, schema: nil, tools: :docker, replay_e2e: false,
         pin: nil, keep_sandbox: false, into: nil, limit_usd: nil,
         model: :flash, reasoning_effort: nil, max_tokens: nil,
-        compaction: nil, seed: nil, notebook: nil)
+        compaction: nil, seed: nil, notebook: nil, max_tool_output: nil)
 
   # Resolve Model Alias
   model = MODEL_ALIASES[model] || MODEL_ALIASES[model.to_sym] || model
@@ -445,6 +484,7 @@ def llm(prompt, schema: nil, tools: :docker, replay_e2e: false,
     model: model,
     reasoning_effort: reasoning_effort,
     max_tokens: max_tokens,
+    max_tool_output: max_tool_output,
     compaction: compaction,
     seed: seed,
     notebook: notebook
@@ -755,6 +795,27 @@ class LLMRunner
           Monitor.status = "Tool: #{name}" unless reason
 
           result = execute_tool(name, args)
+
+          if result.is_a?(Hash) && result[:suspend]
+            # Suspension Signal Detected
+            # We must save state and exit.
+            # Push the assistant message so history is correct.
+            @messages << message
+
+            # Note: We do NOT push the tool result yet, because we need to resume *with* the answer.
+            # But wait, LLM expects tool output if tool_calls were present.
+            # If we resume, we must inject the tool output (the answer).
+            # So here we return the suspended state.
+
+            return {
+              'suspended' => true,
+              'suspend_data' => result,
+              'messages' => @messages, # History up to assistant call
+              'tool_call_id' => tc['id'],
+              'meta' => { 'usage' => @total_usage }
+            }
+          end
+
           tool_results << { tool_call_id: tc['id'], role: 'tool', name: name, content: result }
         end
 
@@ -836,15 +897,10 @@ class LLMRunner
       if impl.arity == 2
         # Check if 2 args. If implementation is a lambda/proc, arity might be flexible?
         # Standardize on (args) or (args, sandbox)
-        # But wait, Builtin task tools only take (args), no sandbox involved.
-        # How do we handle tools that don't need sandbox?
-        # The tool definition wrapper above passes sandbox regardless?
-        # No, look at @tools = tools.transform_values { |t| { definition: t, sandbox: sandbox } }
-        # And impl.call(args, sandbox) vs impl.call(args)
-        # Ruby's arity for blocks:
-        # ->(a,b){} arity is 2
-        # ->(a){} arity is 1
         output = impl.call(args, sandbox)
+      elsif impl.arity == 3
+        # Pass runner instance for advanced control (e.g. pinning messages)
+        output = impl.call(args, sandbox, self)
       else
         output = impl.call(args)
       end
@@ -852,7 +908,34 @@ class LLMRunner
       output = "Error executing #{name}: #{e.message}\n#{e.backtrace.first(5).join("\n")}"
     end
 
-    output.is_a?(String) ? output : output.to_json
+    if output.is_a?(Hash) && output[:suspend]
+      return output
+    end
+
+    output.is_a?(String) ? truncate_output(output) : output.to_json
+  end
+
+  def truncate_output(str)
+    limit = @llm_args[:max_tool_output] || 20_000
+    return str if str.size <= limit
+
+    half = limit / 2
+    head = str[0...half]
+    tail = str[-half..-1]
+    "#{head}\n... [Output Truncated: #{str.size - limit} bytes omitted] ...\n#{tail}"
+  end
+
+  def pin_message(search_text)
+    # Find last message (excluding system?) containing text
+    # pinning system messages is weird but allowed.
+    target = @messages.reverse.find { |m| (m['content'] || m[:content]).to_s.include?(search_text) }
+
+    if target
+      target['pinned'] = true
+      "Pinned message: \"#{search_text}\" (Role: #{target['role']})"
+    else
+      "Message not found containing: \"#{search_text}\""
+    end
   end
 
   def call_openrouter(messages)
@@ -1196,6 +1279,20 @@ end
 
 # --- Built-in Tools Module ---
 module BuiltinTools
+  @@sessions = {}
+
+  def self.register_session(id, state, sandbox)
+    @@sessions[id] = { state: state, sandbox: sandbox }
+  end
+
+  def self.get_session(id)
+    @@sessions[id]
+  end
+
+  def self.clear_session(id)
+    @@sessions.delete(id)
+  end
+
   def self.basic_tools
     {
       'ls' => {
@@ -1618,6 +1715,156 @@ module BuiltinTools
             type: "object",
             properties: { regex: { type: "string" }, path: { type: "string" } },
             required: ["regex"]
+          }
+        }
+      },
+      'start_task' => {
+        implementation: ->(args, sandbox) {
+          instruction = args['instruction']
+          # Recursive call with shared sandbox but isolated context
+          llm(instruction, into: sandbox.path, tools: :basic, compaction: nil).s
+        },
+        schema: {
+          description: "Start a sub-task (sub-agent) to perform a specific instruction. The sub-agent shares the filesystem but has its own isolated context.",
+          parameters: {
+            type: "object",
+            properties: {
+              instruction: { type: "string", description: "The instruction for the sub-agent" }
+            },
+            required: ["instruction"]
+          }
+        }
+      },
+      'delegate_task' => {
+        implementation: ->(args, sandbox) {
+          instruction = args['instruction']
+
+          # Initialize recursive task
+          # We need to inject `ask_parent` tool into the sub-agent.
+          # We can pass custom tools via `tools` argument if we construct a map.
+          # Or we can just use :docker (which resolves to builtins) and modify BuiltinTools?
+          # Easier: BuiltinTools implicitly includes ask_parent now.
+
+          # We need to loop to handle suspensions.
+
+          # Initial call
+          result = llm(instruction, into: sandbox.path, tools: :docker, compaction: nil)
+
+          loop do
+            if result.is_a?(Hash) && result['suspended']
+              # Sub-agent suspended to ask a question
+              question = result['suspend_data'][:question]
+
+              # Save session state
+              task_id = SecureRandom.hex(4)
+              sub_task_storage ||= {}
+              sub_task_storage[task_id] = result
+
+              # Expose storage globally? No, BuiltinTools is a module.
+              # Use a class variable on BuiltinTools or a global constant.
+              BuiltinTools.register_session(task_id, result, sandbox)
+
+              return "Task [#{task_id}] Paused. The sub-agent asks: \"#{question}\".\n" +
+                     "Use `reply_to_task(id: '#{task_id}', answer: '...')` to answer and resume."
+            else
+              # Done
+              return result.s
+            end
+          end
+        },
+        schema: {
+          description: "Delegate a complex task to a sub-agent. Returns final result OR a pause message if the sub-agent asks a question.",
+          parameters: {
+            type: "object",
+            properties: {
+              instruction: { type: "string", description: "The task instruction" }
+            },
+            required: ["instruction"]
+          }
+        }
+      },
+      'reply_to_task' => {
+        implementation: ->(args, sandbox) {
+          task_id = args['id']
+          answer = args['answer']
+
+          session = BuiltinTools.get_session(task_id)
+          return "Error: Task ID #{task_id} not found." unless session
+
+          # Resume logic
+          # 1. Retrieve suspended state
+          # 2. Append the answer as the tool result for the suspension point
+          suspended_state = session[:state]
+          sub_sandbox = session[:sandbox] # Should be same as current usually
+
+          tool_call_id = suspended_state['tool_call_id']
+          messages = suspended_state['messages']
+
+          # Add the answer
+          messages << { role: 'tool', tool_call_id: tool_call_id, name: 'ask_parent', content: answer }
+
+          # Resume LLM call
+          # We need to call `llm` but using EXISTING history `messages` (and sandbox).
+          # `llm` helper usually starts fresh or takes a prompt.
+          # We need a way to pass PRE-EXISTING messages to `llm`.
+          # The `llm` method constructs `LLMRunner`.
+          # We can overload `llm` to accept `messages` instead of `prompt`?
+          # `LLMRunner.new` takes `prompt`. If array, it uses it.
+
+          result = llm(messages, into: sub_sandbox.path, tools: :docker, compaction: nil)
+
+           loop do
+            if result.is_a?(Hash) && result['suspended']
+              # Suspended AGAIN
+              question = result['suspend_data'][:question]
+
+              # Update session state
+              BuiltinTools.register_session(task_id, result, sub_sandbox)
+
+              return "Task [#{task_id}] Paused AGAIN. Question: \"#{question}\".\nUse `reply_to_task` to answer."
+            else
+              # Done
+              BuiltinTools.clear_session(task_id)
+              return "Task [#{task_id}] Completed.\nResult: #{result.s}"
+            end
+          end
+        },
+        schema: {
+          description: "Reply to a question from a suspended sub-task.",
+          parameters: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Task ID provided in the pause message" },
+              answer: { type: "string", description: "Answer to the sub-agent's question" }
+            },
+            required: ["id", "answer"]
+          }
+        }
+      },
+      'ask_parent' => {
+        implementation: ->(args) {
+          # Signal suspension
+          { suspend: true, question: args['question'] }
+        },
+        schema: {
+          description: "Ask the main agent (user/parent) a question. Execution will pause until answered.",
+          parameters: {
+            type: "object",
+            properties: { question: { type: "string" } },
+            required: ["question"]
+          }
+        }
+      },
+      'pin_message' => {
+        implementation: ->(args, sandbox, runner) {
+           runner.pin_message(args['search_text'])
+        },
+        schema: {
+          description: "Pin a message containing specific text so it isn't dropped during compaction.",
+          parameters: {
+            type: "object",
+            properties: { search_text: { type: "string" } },
+            required: ["search_text"]
           }
         }
       }
