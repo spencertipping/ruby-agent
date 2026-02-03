@@ -1,0 +1,1 @@
+pkg-config --list-all | grep vterm

@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/mytmux.dir/src/main.cpp.o CMakeFiles/mytmux.dir/src/Tab.cpp.o -o mytmux  -lvterm -lncursesw -ltinfo /usr/lib/x86_64-linux-gnu/libutil.a 

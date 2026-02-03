@@ -1,0 +1,3 @@
+/data/CMakeFiles/mytmux.dir
+/data/CMakeFiles/edit_cache.dir
+/data/CMakeFiles/rebuild_cache.dir

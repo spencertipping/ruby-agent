@@ -900,7 +900,17 @@ class LLMRunner
 
     body = {
       model: model,
-      messages: messages,
+      # Merge reasoning into content to preserve context but avoid signature errors
+      messages: messages.map do |m|
+        m = m.dup
+        if (reasoning = m.delete('reasoning') || m.delete(:reasoning))
+          content = m['content'] || m[:content] || ""
+          m['content'] = "<thought>\n#{reasoning}\n</thought>\n\n#{content}"
+        end
+        m.delete('reasoning_details') # Clean up details too
+        m.delete(:reasoning_details)
+        m
+      end,
       stream: true
     }
 
