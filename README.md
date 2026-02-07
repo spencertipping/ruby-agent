@@ -3,6 +3,13 @@
 
 **NOTE:** This project is functional and I've used it to build some stuff, but it's under-documented.
 
+You can see the core mechanics outlined in the LLM-generated (but not terrible) tutorial:
+
++ [doc/agent-01.md](doc/agent-01.md)
++ [doc/agent-02.md](doc/agent-02.md)
++ [doc/agent-03.md](doc/agent-03.md)
++ [doc/agent-04.md](doc/agent-04.md)
+
 
 ## Basic usage
 First, `export OPENROUTER_API_KEY=sk-...`. I strongly recommend setting a budget for your keys on [OpenRouter](https://openrouter.ai) before doing this, although `llm` implements its own cost limiting as well.
